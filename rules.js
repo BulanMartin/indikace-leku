@@ -6,9 +6,24 @@ const DRUGS = {
 function evaluate(drug,v){
  const out={ind:[],safe:[],pay:[],gp:[]};
  const yes=(x)=>v[x]==='yes', known=x=>v[x]!==''&&v[x]!==undefined, n=x=>known(x)?Number(v[x]):null;
- const check=(part,condition,text)=>out[part].push({status:condition===null?'unknown':condition?'pass':'fail',text});
- const b=(part,key,text)=>check(part,known(key)?yes(key):null,text);
- const num=(part,key,fn,text)=>check(part,n(key)===null?null:fn(n(key)),text);
+ const dependencies=text=>{
+  if(text.startsWith('Je zvolena'))return ['route'];
+  if(text.startsWith('Je určena'))return ['phase'];
+  if(text.startsWith('Nedostatečná kompenzace'))return v.regimen==='switch'?['regimen']:['regimen','uncontrolled','maxmet'];
+  if(text.startsWith('Přídatná léčba'))return v.regimen==='none'?['regimen','metintol',...(drug==='trajenta'?['metrenal']:[])]:['regimen'];
+  if(text.startsWith('Vybrané hrazené')||text.startsWith('Balení odpovídá'))return ['pack'];
+  if(text.startsWith('Kombinace léčby'))return ['regimen'];
+  if(text.startsWith('Po 6 měsících relativní'))return ['hba0','hba6'];
+  if(text.startsWith('Po 6 měsících současně'))return ['weight0','weight6'];
+  if(text.startsWith('eGFR 20–90'))return ['gfr','dm',...(n('gfr')>(yes('dm')?75:45)?['uacr']:[])];
+  if(text.startsWith('NYHA'))return ['nyha'];
+  if(text.startsWith('Doplnit ejekční'))return ['ef'];
+  if(text.startsWith('Při EF'))return ['ef','nt','af'];
+  return [];
+ };
+ const check=(part,condition,text,keys=dependencies(text))=>out[part].push({status:condition===null?'unknown':condition?'pass':'fail',text,keys});
+ const b=(part,key,text)=>check(part,known(key)?yes(key):null,text,[key]);
+ const num=(part,key,fn,text)=>check(part,n(key)===null?null:fn(n(key)),text,[key]);
  const route=v.route||'dm', f=drug==='forxiga',j=drug==='jentadueto';
  check('ind',known('route')?true:null,'Je zvolena posuzovaná indikace.');
  check('safe',known('phase')?true:null,'Je určena fáze léčby.');
@@ -18,7 +33,7 @@ function evaluate(drug,v){
  if(j){check('ind',known('regimen')?(v.regimen==='switch'||(['met','metsu','meti'].includes(v.regimen)&&yes('uncontrolled')&&yes('maxmet'))):null,'Nedostatečná kompenzace na maximální tolerované dávce metforminu (± další lék), nebo převod z linagliptinu + metforminu.');}
  else { b('ind','uncontrolled','Je potřebné zlepšit glykemickou kompenzaci.');check('ind',known('regimen')?(v.regimen!=='none'||yes('metintol')||(!f&&yes('metrenal'))):null,'Přídatná léčba, nebo monoterapie při nevhodnosti metforminu dle SPC.'); }
  } else b('ind','diagnosis',route==='hf'?'Potvrzené symptomatické chronické srdeční selhání.':'Potvrzené chronické onemocnění ledvin.');
- ['allergy','type1','acute','pregnant'].forEach(k=>check('safe',known(k)?!yes(k):null,({allergy:'Bez hypersenzitivity na složky přípravku.',type1:'Nejde o diabetes 1. typu.',acute:'Bez akutního stavu vyžadujícího odklad / přerušení léčby.',pregnant:'Bez těhotenství či kojení vyžadujícího individuální rozhodnutí.'})[k]));
+ ['allergy','type1','acute','pregnant'].forEach(k=>check('safe',known(k)?!yes(k):null,({allergy:'Bez hypersenzitivity na složky přípravku.',type1:'Nejde o diabetes 1. typu.',acute:'Bez akutního stavu vyžadujícího odklad / přerušení léčby.',pregnant:'Bez těhotenství či kojení vyžadujícího individuální rozhodnutí.'})[k],[k]));
  if(f){num('safe','gfr',x=>v.phase==='start'?x>=25:true,'Při zahájení GFR ≥25 ml/min; při nižší hodnotě se zahájení nedoporučuje.');b('safe','riskreview','Posouzena hydratace, hypotenze, riziko ketoacidózy, infekce, jaterní funkce a interakce dle SPC.');}
  if(j){num('safe','gfr',x=>x>=30,'GFR ≥30 ml/min; pod 30 je metformin kontraindikován.');num('safe','gfr',x=>x>=45,'Fixní síla 850/1 000 mg 2× denně je slučitelná s renálním limitem; při GFR 30–44 použít samostatné složky.');b('safe','metreview','Vyloučeny kontraindikace metforminu: acidóza/prekomatózní stav, dehydratace, závažná infekce/šok, hypoxie, jaterní insuficience, intoxikace alkoholem/alkoholismus.');b('safe','dosereview','Síla odpovídá dosavadní dávce a toleranci metforminu; posouzena přerušení při kontrastu / operaci.');}
  if(!f)b('safe','riskreview','Posouzena pankreatitida, pemfigoid, hypoglykemie a lékové interakce dle SPC.');
@@ -47,4 +62,15 @@ function evaluate(drug,v){
  const state=arr=>arr.some(x=>x.status==='fail')?'fail':arr.some(x=>x.status==='unknown')?'unknown':'pass';
  out.states=Object.fromEntries(['ind','safe','pay','gp'].map(k=>[k,state(out[k])]));out.total=state(Object.values(out).filter(Array.isArray).flat());return out;
 }
-if(typeof module!=='undefined')module.exports={evaluate,DRUGS};
+function fieldFeedback(result,key,values){
+ const relevant=part=>result[part].filter(x=>x.keys.includes(key));
+ const clinical=[...relevant('ind'),...relevant('safe')],prescription=[...relevant('pay'),...relevant('gp')];
+ const all=[...clinical,...prescription];
+ if(values[key]===''||values[key]===undefined||!all.length)return {tone:'neutral',text:'Zatím neposouzeno / pro tuto větev se nehodnotí.'};
+ // Coupled conditions remain pending until their necessary inputs are available.
+ if(clinical.some(x=>x.status==='fail'&&x.keys.every(k=>values[k]!==''&&values[k]!==undefined)))return {tone:'red',text:'Podání ani hrazený předpis nelze potvrdit: '+clinical.filter(x=>x.status==='fail').map(x=>x.text).join(' ')};
+ if(all.some(x=>x.status==='unknown'||(x.status!=='pass'&&x.keys.some(k=>values[k]===''||values[k]===undefined))))return {tone:'neutral',text:'Doplňte související údaje pro posouzení tohoto pole.'};
+ if(prescription.some(x=>x.status==='fail'))return {tone:'yellow',text:'Tento údaj nebrání podání, ale nesplňuje podmínku hrazeného předpisu: '+prescription.filter(x=>x.status==='fail').map(x=>x.text).join(' ')};
+ return {tone:'green',text:'Podmínky podání i hrazeného předpisu pro tento údaj jsou splněny. Celkové posouzení je v panelu výsledku.'};
+}
+if(typeof module!=='undefined')module.exports={evaluate,DRUGS,fieldFeedback};
